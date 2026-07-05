@@ -12,6 +12,16 @@ from PIL import Image
 SOURCE = "tomsk"
 SOURCE_DISPLAY = "Tomsk Space Observing System"
 
+# The current Tomsk shm.jpg image is 1540x460 and shows ~3 days.
+# This crop pulls the newest/rightmost 24-hour strip from the spectrogram.
+# If Tomsk changes the image layout, these are the first values to retune.
+TOMSK_DAILY_CROP = {
+    "left": 1018,
+    "top": 30,
+    "right": 1500,
+    "bottom": 430,
+}
+
 R2_ACCOUNT_ID = os.environ["R2_ACCOUNT_ID"]
 R2_BUCKET_NAME = os.environ["R2_BUCKET_NAME"]
 R2_ACCESS_KEY_ID = os.environ["R2_ACCESS_KEY_ID"]
@@ -32,6 +42,21 @@ s3 = boto3.client(
 
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def image_to_webp_bytes(image: Image.Image, quality: int = 88) -> bytes:
+    out = BytesIO()
+    image.save(out, format="WEBP", quality=quality, method=6)
+    return out.getvalue()
+
+
+def clamp_crop_box(image: Image.Image, crop: dict) -> tuple[int, int, int, int]:
+    width, height = image.size
+    left = max(0, min(width, int(crop["left"])))
+    top = max(0, min(height, int(crop["top"])))
+    right = max(left + 1, min(width, int(crop["right"])))
+    bottom = max(top + 1, min(height, int(crop["bottom"])))
+    return left, top, right, bottom
 
 
 def get_existing_manifest() -> dict:
@@ -76,17 +101,20 @@ def main() -> None:
     original_hash = sha256_bytes(original_bytes)
 
     image = Image.open(BytesIO(original_bytes)).convert("RGB")
+    image_width, image_height = image.size
 
-    out = BytesIO()
-    image.save(out, format="WEBP", quality=88, method=6)
-    webp_bytes = out.getvalue()
+    raw_webp_bytes = image_to_webp_bytes(image)
+
+    crop_box = clamp_crop_box(image, TOMSK_DAILY_CROP)
+    daily_image = image.crop(crop_box)
+    daily_webp_bytes = image_to_webp_bytes(daily_image)
 
     raw_key = f"schumann/tomsk/raw/{year}/{month}/{date_str}.webp"
     daily_key = f"schumann/tomsk/daily/{year}/{month}/{date_str}.webp"
     manifest_key = "schumann/tomsk/manifest.json"
 
-    upload_bytes(raw_key, webp_bytes, "image/webp")
-    upload_bytes(daily_key, webp_bytes, "image/webp")
+    upload_bytes(raw_key, raw_webp_bytes, "image/webp")
+    upload_bytes(daily_key, daily_webp_bytes, "image/webp")
 
     manifest = get_existing_manifest()
     manifest["version"] = 1
@@ -110,6 +138,18 @@ def main() -> None:
         "raw_url": f"{R2_PUBLIC_BASE_URL}/{raw_key}",
         "daily_url": f"{R2_PUBLIC_BASE_URL}/{daily_key}",
         "sha256": original_hash,
+        "raw_sha256": sha256_bytes(raw_webp_bytes),
+        "daily_sha256": sha256_bytes(daily_webp_bytes),
+        "source_image_size": {
+            "width": image_width,
+            "height": image_height,
+        },
+        "daily_crop": {
+            "left": crop_box[0],
+            "top": crop_box[1],
+            "right": crop_box[2],
+            "bottom": crop_box[3],
+        },
         "status": "ok",
     })
 
@@ -119,7 +159,8 @@ def main() -> None:
     upload_bytes(manifest_key, manifest_bytes, "application/json")
 
     print(f"Archived Tomsk Schumann image for {date_str}")
-    print(f"Daily URL: {R2_PUBLIC_BASE_URL}/{daily_key}")
+    print(f"Raw URL: {R2_PUBLIC_BASE_URL}/{raw_key}")
+    print(f"Daily crop URL: {R2_PUBLIC_BASE_URL}/{daily_key}")
     print(f"Manifest: {R2_PUBLIC_BASE_URL}/{manifest_key}")
 
 
