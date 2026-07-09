@@ -1,11 +1,13 @@
 import argparse
 import json
 import os
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
 from tomsk_archive_utils import (
     SOURCE,
+    SOURCE_DISPLAY,
     build_processed_snapshot,
     date_from_raw_key,
     image_to_webp_bytes,
@@ -242,6 +244,7 @@ def run_r2_backfill(args) -> None:
     manifest = load_existing_manifest(s3, bucket, public_base_url, captured_at)
     manifest["version"] = 2
     manifest["source"] = SOURCE
+    manifest["source_display"] = SOURCE_DISPLAY
     manifest["updated_at"] = captured_at
     manifest["public_base_url"] = public_base_url
     manifest["processing_mode"] = "raw_3day_snapshot_plus_overlap_stitched_timeline"
