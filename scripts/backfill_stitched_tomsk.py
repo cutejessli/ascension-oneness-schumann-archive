@@ -96,6 +96,18 @@ def local_raw_inputs(input_dir: Path) -> list[tuple[str, str, bytes]]:
     return results
 
 
+def filter_inputs_by_date(
+    inputs: list[tuple[str, str, bytes]],
+    start_date: str | None,
+    end_date: str | None,
+) -> list[tuple[str, str, bytes]]:
+    return [
+        item
+        for item in inputs
+        if (not start_date or item[0] >= start_date) and (not end_date or item[0] <= end_date)
+    ]
+
+
 def print_debug(snapshot, stitch_info: dict[str, Any] | None = None) -> None:
     processing = snapshot.processing
     edge = processing["edge_trim"]
@@ -109,9 +121,12 @@ def print_debug(snapshot, stitch_info: dict[str, Any] | None = None) -> None:
     if stitch_info:
         print(
             f"  stitch status={stitch_info.get('status')} "
-            f"overlap={stitch_info.get('overlap_px')} "
-            f"append={stitch_info.get('append_width_px')} "
-            f"score={stitch_info.get('match_score_mean_abs_difference')} "
+            f"overlap={stitch_info.get('overlap_px')}px ({stitch_info.get('overlap_percent')}%) "
+            f"append={stitch_info.get('append_width_px')}px ({stitch_info.get('append_percent')}%) "
+            f"raw_score={stitch_info.get('match_score_mean_abs_difference')} "
+            f"expected_penalty={stitch_info.get('expected_overlap_penalty')} "
+            f"final_score={stitch_info.get('final_match_score')} "
+            f"timeline_width={stitch_info.get('resulting_timeline_width_px')} "
             f"confidence={stitch_info.get('confidence')}"
         )
 
@@ -147,8 +162,9 @@ def run_local_dry_run(args) -> None:
     captured_at = utc_now_iso()
     public_base_url = args.public_base_url or "https://local.example"
     inputs = local_raw_inputs(input_dir)
+    inputs = filter_inputs_by_date(inputs, args.start_date, args.end_date)
     if not inputs:
-        raise SystemExit(f"No dated raw images found in {input_dir}")
+        raise SystemExit(f"No dated raw images found in {input_dir} for the requested date range")
 
     snapshots, timeline, stitch_steps = rebuild_from_inputs(
         inputs,
@@ -182,16 +198,21 @@ def run_local_dry_run(args) -> None:
             "width": timeline.width,
             "height": timeline.height,
             "mode": "rebuilt_from_raw_snapshots",
+            "date_range": {"start": snapshots[0].date, "end": snapshots[-1].date},
+            "snapshot_count": len(snapshots),
             "steps": stitch_steps,
             "status": "rebuilt",
         }
 
     manifest = manifest_base(public_base_url, captured_at)
     manifest["stitched"] = stitched_meta
-    manifest["items"] = [
-        {**item_from_processed_snapshot(snapshot, captured_at), "stitched": stitched_meta}
-        for snapshot in reversed(snapshots)
-    ]
+    step_by_date = {step.get("date"): step for step in stitch_steps}
+    manifest["items"] = []
+    for snapshot in reversed(snapshots):
+        item = item_from_processed_snapshot(snapshot, captured_at)
+        item["stitched"] = stitched_meta
+        item["stitch_diagnostic"] = step_by_date.get(snapshot.date)
+        manifest["items"].append(item)
     write_json(out_dir / "schumann" / "tomsk" / "manifest.json", manifest)
     print(f"Dry run complete: {out_dir}")
 
@@ -210,6 +231,13 @@ def run_r2_backfill(args) -> None:
         for key in raw_keys
         if date_from_raw_key(key)
     ]
+    inputs = filter_inputs_by_date(inputs, args.start_date, args.end_date)
+    if not inputs:
+        raise SystemExit("No R2 raw snapshots found for the requested date range")
+    print(
+        f"Rebuilding from {len(inputs)} raw snapshots: "
+        f"{inputs[0][0]} through {inputs[-1][0]}"
+    )
     snapshots, timeline, stitch_steps = rebuild_from_inputs(
         inputs,
         public_base_url=public_base_url,
@@ -237,6 +265,8 @@ def run_r2_backfill(args) -> None:
             "width": timeline.width,
             "height": timeline.height,
             "mode": "rebuilt_from_raw_snapshots",
+            "date_range": {"start": snapshots[0].date, "end": snapshots[-1].date},
+            "snapshot_count": len(snapshots),
             "steps": stitch_steps,
             "status": "rebuilt",
         }
@@ -249,10 +279,23 @@ def run_r2_backfill(args) -> None:
     manifest["public_base_url"] = public_base_url
     manifest["processing_mode"] = "raw_3day_snapshot_plus_overlap_stitched_timeline"
     manifest["stitched"] = stitched_meta
-    manifest["items"] = [
-        {**item_from_processed_snapshot(snapshot, captured_at), "stitched": stitched_meta}
-        for snapshot in reversed(snapshots)
-    ][:400]
+    rebuilt_dates = {snapshot.date for snapshot in snapshots}
+    existing_items = [
+        item for item in manifest.get("items", [])
+        if item.get("date") not in rebuilt_dates
+    ]
+    step_by_date = {step.get("date"): step for step in stitch_steps}
+    rebuilt_items = []
+    for snapshot in snapshots:
+        item = item_from_processed_snapshot(snapshot, captured_at)
+        item["stitched"] = stitched_meta
+        item["stitch_diagnostic"] = step_by_date.get(snapshot.date)
+        rebuilt_items.append(item)
+    manifest["items"] = sorted(
+        [*existing_items, *rebuilt_items],
+        key=lambda item: item.get("date", ""),
+        reverse=True,
+    )[:400]
 
     manifest_bytes = json.dumps(manifest, indent=2).encode("utf-8")
     put_r2_object_bytes(s3, bucket, "schumann/tomsk/manifest.json", manifest_bytes, "application/json")
@@ -267,8 +310,16 @@ def parse_args():
     parser.add_argument("--local-input-dir", help="Process local dated raw images instead of R2. Filenames must start YYYY-MM-DD.")
     parser.add_argument("--out-dir", default="out", help="Local output folder for --local-input-dir dry runs.")
     parser.add_argument("--public-base-url", default="", help="Public base URL used in dry-run manifest output.")
+    parser.add_argument("--start-date", help="First YYYY-MM-DD raw snapshot to include in the rebuild.")
+    parser.add_argument("--end-date", help="Last YYYY-MM-DD raw snapshot to include in the rebuild.")
     parser.add_argument("--write-processed", action="store_true", help="Overwrite processed/daily images during R2 backfill.")
-    return parser.parse_args()
+    args = parser.parse_args()
+    for value in (args.start_date, args.end_date):
+        if value and (len(value) != 10 or value[4] != "-" or value[7] != "-"):
+            parser.error("--start-date and --end-date must use YYYY-MM-DD")
+    if args.start_date and args.end_date and args.start_date > args.end_date:
+        parser.error("--start-date cannot be after --end-date")
+    return args
 
 
 def main() -> None:
