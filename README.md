@@ -37,7 +37,7 @@ The app should prefer `processed_url` when available and keep `daily_url` for ba
 R2 backfill:
 
 ```bash
-python scripts/backfill_stitched_tomsk.py
+python scripts/backfill_stitched_tomsk.py --start-date 2026-07-05 --end-date 2026-07-14 --write-processed
 ```
 
 Local dry run:
@@ -61,7 +61,11 @@ Debug output includes:
 - black ratio
 - overlap pixels
 - append width
-- match score
+- overlap percentage
+- raw match score
+- expected-overlap penalty
+- final match score
+- resulting timeline width
 - match confidence
 
 ## Manual GitHub backfill
