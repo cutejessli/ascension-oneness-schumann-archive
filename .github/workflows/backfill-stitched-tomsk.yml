@@ -1,0 +1,60 @@
+name: Backfill Tomsk stitched timeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: "First raw snapshot date to rebuild (YYYY-MM-DD)"
+        required: false
+        default: ""
+        type: string
+      end_date:
+        description: "Last raw snapshot date to rebuild (YYYY-MM-DD)"
+        required: false
+        default: ""
+        type: string
+      write_processed:
+        description: "Overwrite existing processed/daily images"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Backfill stitched Tomsk archive
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_PUBLIC_BASE_URL: ${{ secrets.R2_PUBLIC_BASE_URL }}
+        run: |
+          ARGS=""
+          if [ -n "${{ inputs.start_date }}" ]; then
+            ARGS="$ARGS --start-date ${{ inputs.start_date }}"
+          fi
+          if [ -n "${{ inputs.end_date }}" ]; then
+            ARGS="$ARGS --end-date ${{ inputs.end_date }}"
+          fi
+          if [ "${{ inputs.write_processed }}" = "true" ]; then
+            python scripts/backfill_stitched_tomsk.py --write-processed $ARGS
+          else
+            python scripts/backfill_stitched_tomsk.py $ARGS
+          fi
