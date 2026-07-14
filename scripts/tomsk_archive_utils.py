@@ -29,11 +29,21 @@ EDGE_EMPTY_NON_DARK_RATIO = float(os.environ.get("EDGE_EMPTY_NON_DARK_RATIO", "0
 MAX_RIGHT_EDGE_TRIM_RATIO = float(os.environ.get("MAX_RIGHT_EDGE_TRIM_RATIO", "0.35"))
 MAX_LEFT_EDGE_TRIM_RATIO = float(os.environ.get("MAX_LEFT_EDGE_TRIM_RATIO", "0.08"))
 
+# A Tomsk capture covers roughly three days. Consecutive daily captures should
+# therefore share about two days, leaving about one new day to append.
 STITCH_MATCH_SCALE = int(os.environ.get("STITCH_MATCH_SCALE", "4"))
 STITCH_MATCH_HEIGHT = int(os.environ.get("STITCH_MATCH_HEIGHT", "96"))
-STITCH_MIN_OVERLAP_RATIO = float(os.environ.get("STITCH_MIN_OVERLAP_RATIO", "0.45"))
-STITCH_MAX_OVERLAP_RATIO = float(os.environ.get("STITCH_MAX_OVERLAP_RATIO", "0.94"))
-STITCH_MAX_MATCH_SCORE = float(os.environ.get("STITCH_MAX_MATCH_SCORE", "18"))
+STITCH_EXPECTED_OVERLAP_RATIO = float(os.environ.get("STITCH_EXPECTED_OVERLAP_RATIO", "0.6667"))
+STITCH_MIN_OVERLAP_RATIO = float(os.environ.get("STITCH_MIN_OVERLAP_RATIO", "0.55"))
+STITCH_MAX_OVERLAP_RATIO = float(os.environ.get("STITCH_MAX_OVERLAP_RATIO", "0.78"))
+STITCH_EXPECTED_OVERLAP_PENALTY = float(os.environ.get("STITCH_EXPECTED_OVERLAP_PENALTY", "120"))
+# A daily append substantially below 28% is not credible for a three-day
+# source frame. It is almost always the old near-maximum-overlap failure.
+STITCH_MIN_APPEND_RATIO = float(os.environ.get("STITCH_MIN_APPEND_RATIO", "0.28"))
+STITCH_MAX_APPEND_RATIO = float(os.environ.get("STITCH_MAX_APPEND_RATIO", "0.42"))
+STITCH_MAX_RAW_MATCH_SCORE = float(os.environ.get("STITCH_MAX_RAW_MATCH_SCORE", "60"))
+STITCH_CONTENT_TOP_RATIO = float(os.environ.get("STITCH_CONTENT_TOP_RATIO", "0.06"))
+STITCH_CONTENT_BOTTOM_RATIO = float(os.environ.get("STITCH_CONTENT_BOTTOM_RATIO", "0.92"))
 STITCH_NEAR_DUPLICATE_APPEND_PX = int(os.environ.get("STITCH_NEAR_DUPLICATE_APPEND_PX", "25"))
 MAX_STITCH_WIDTH = int(os.environ.get("MAX_STITCH_WIDTH", "0"))
 
@@ -175,9 +185,24 @@ def normalize_height(image: Image.Image, height: int) -> Image.Image:
     return image.resize((width, height), Image.Resampling.BICUBIC)
 
 
-def resized_for_match(image: Image.Image) -> Image.Image:
+def resized_for_match(image: Image.Image) -> tuple[Image.Image, dict[str, int]]:
+    """Downsample only the chart-content band used for overlap comparison.
+
+    The crop intentionally skips the top and bottom strips where source labels,
+    axes, and static framing can otherwise win an image-difference match.
+    """
+
     width = max(1, image.width // max(1, STITCH_MATCH_SCALE))
-    return image.convert("L").resize((width, STITCH_MATCH_HEIGHT), Image.Resampling.BILINEAR)
+    full_height = max(1, STITCH_MATCH_HEIGHT)
+    resized = image.convert("L").resize((width, full_height), Image.Resampling.BILINEAR)
+    top = max(0, min(full_height - 1, round(full_height * STITCH_CONTENT_TOP_RATIO)))
+    bottom = max(top + 1, min(full_height, round(full_height * STITCH_CONTENT_BOTTOM_RATIO)))
+    return resized.crop((0, top, width, bottom)), {
+        "full_height": full_height,
+        "content_top_px": top,
+        "content_bottom_px": bottom,
+        "content_height_px": bottom - top,
+    }
 
 
 def mean_abs_difference(left: Image.Image, right: Image.Image) -> float:
@@ -186,40 +211,81 @@ def mean_abs_difference(left: Image.Image, right: Image.Image) -> float:
 
 
 def find_best_overlap(existing: Image.Image, new: Image.Image) -> dict[str, Any]:
-    existing_small = resized_for_match(existing)
-    new_small = resized_for_match(new)
+    existing_small, content_rows = resized_for_match(existing)
+    new_small, _ = resized_for_match(new)
     max_possible = min(existing_small.width, new_small.width)
-    min_overlap = max(12, int(max_possible * STITCH_MIN_OVERLAP_RATIO))
-    max_overlap = max(min_overlap, int(max_possible * STITCH_MAX_OVERLAP_RATIO))
+    # Ratio is based on the incoming three-day snapshot, rather than the much
+    # wider stitched timeline. This keeps a daily capture near its expected
+    # two-day overlap / one-day append shape.
+    reference_width = new_small.width
+    min_overlap = max(12, int(reference_width * STITCH_MIN_OVERLAP_RATIO))
+    max_overlap = min(max_possible, max(min_overlap, int(reference_width * STITCH_MAX_OVERLAP_RATIO)))
 
-    best_overlap = min_overlap
-    best_score = float("inf")
+    candidates: list[dict[str, Any]] = []
     for overlap in range(min_overlap, max_overlap + 1):
         existing_tail = existing_small.crop((existing_small.width - overlap, 0, existing_small.width, existing_small.height))
         new_head = new_small.crop((0, 0, overlap, new_small.height))
-        score = mean_abs_difference(existing_tail, new_head)
-        if score < best_score:
-            best_score = score
-            best_overlap = overlap
+        raw_score = mean_abs_difference(existing_tail, new_head)
+        overlap_ratio = overlap / reference_width
+        expected_penalty = abs(overlap_ratio - STITCH_EXPECTED_OVERLAP_RATIO) * STITCH_EXPECTED_OVERLAP_PENALTY
+        final_score = raw_score + expected_penalty
+        overlap_px = min(new.width, max(1, overlap * max(1, STITCH_MATCH_SCALE)))
+        append_width = max(0, new.width - overlap_px)
+        append_ratio = append_width / max(1, new.width)
+        candidates.append({
+            "overlap": overlap,
+            "overlap_ratio": overlap_ratio,
+            "overlap_px": overlap_px,
+            "append_width": append_width,
+            "append_ratio": append_ratio,
+            "raw_score": raw_score,
+            "expected_penalty": expected_penalty,
+            "final_score": final_score,
+        })
 
-    overlap_px = min(new.width, max(1, best_overlap * max(1, STITCH_MATCH_SCALE)))
-    append_width = max(0, new.width - overlap_px)
-    confidence = "ok" if best_score <= STITCH_MAX_MATCH_SCORE else "low"
+    plausible_candidates = [
+        candidate
+        for candidate in candidates
+        if STITCH_MIN_APPEND_RATIO <= candidate["append_ratio"] <= STITCH_MAX_APPEND_RATIO
+    ]
+    selection_pool = plausible_candidates or candidates
+    best = min(selection_pool, key=lambda candidate: candidate["final_score"])
+
+    # If image matching produces only implausible append widths, preserve the
+    # expected daily cadence instead of silently swallowing a real chart day.
+    forced_expected_overlap = False
+    if not plausible_candidates:
+        expected_overlap = max(min_overlap, min(max_overlap, round(reference_width * STITCH_EXPECTED_OVERLAP_RATIO)))
+        best = next(candidate for candidate in candidates if candidate["overlap"] == expected_overlap)
+        forced_expected_overlap = True
+
+    confidence = "ok" if best["raw_score"] <= STITCH_MAX_RAW_MATCH_SCORE else "low"
     warnings = []
     if confidence == "low":
         warnings.append("low_confidence_overlap_match")
+    if forced_expected_overlap:
+        warnings.append("forced_expected_overlap_after_implausible_append_candidates")
+    if not STITCH_MIN_APPEND_RATIO <= best["append_ratio"] <= STITCH_MAX_APPEND_RATIO:
+        warnings.append("implausible_daily_append_width")
 
     return {
-        "status": "matched",
+        "status": "matched_expected_overlap" if forced_expected_overlap else "matched",
         "confidence": confidence,
-        "overlap_px": overlap_px,
-        "append_width_px": append_width,
-        "match_score_mean_abs_difference": round(best_score, 4),
-        "match_score_threshold": STITCH_MAX_MATCH_SCORE,
+        "overlap_px": best["overlap_px"],
+        "overlap_percent": round(best["overlap_ratio"] * 100, 2),
+        "append_width_px": best["append_width"],
+        "append_percent": round(best["append_ratio"] * 100, 2),
+        "match_score_mean_abs_difference": round(best["raw_score"], 4),
+        "expected_overlap_penalty": round(best["expected_penalty"], 4),
+        "final_match_score": round(best["final_score"], 4),
+        "expected_overlap_percent": round(STITCH_EXPECTED_OVERLAP_RATIO * 100, 2),
+        "match_score_threshold": STITCH_MAX_RAW_MATCH_SCORE,
         "match_scale": STITCH_MATCH_SCALE,
-        "match_height": STITCH_MATCH_HEIGHT,
+        "match_content_rows": content_rows,
         "min_overlap_ratio": STITCH_MIN_OVERLAP_RATIO,
         "max_overlap_ratio": STITCH_MAX_OVERLAP_RATIO,
+        "min_append_ratio": STITCH_MIN_APPEND_RATIO,
+        "max_append_ratio": STITCH_MAX_APPEND_RATIO,
         "warnings": warnings,
     }
 
@@ -233,9 +299,9 @@ def append_with_overlap(existing: Image.Image, new: Image.Image) -> tuple[Image.
         return existing, overlap
 
     if overlap["confidence"] == "low":
-        overlap["status"] = "appended_full_width_low_confidence"
-        overlap["overlap_px"] = 0
-        overlap["append_width_px"] = new.width
+        # The overlap range remains constrained even on a low-confidence match.
+        # Full-width appends duplicate two days of a three-day chart.
+        overlap["warnings"].append("low_confidence_match_kept_with_expected_overlap_window")
 
     appended_region = new.crop((overlap["overlap_px"], 0, new.width, new.height))
     stitched = Image.new("RGB", (existing.width + appended_region.width, existing.height))
@@ -248,6 +314,7 @@ def append_with_overlap(existing: Image.Image, new: Image.Image) -> tuple[Image.
         overlap["max_width_trimmed_left_px"] = trim_left
         overlap["max_stitch_width"] = MAX_STITCH_WIDTH
 
+    overlap["resulting_timeline_width_px"] = stitched.width
     return stitched, overlap
 
 
@@ -262,8 +329,13 @@ def rebuild_stitched_timeline(processed_images: Iterable[tuple[str, Image.Image]
                 "date": date_str,
                 "status": "initialized",
                 "overlap_px": 0,
+                "overlap_percent": 0,
                 "append_width_px": image.width,
+                "append_percent": 100,
                 "match_score_mean_abs_difference": None,
+                "expected_overlap_penalty": None,
+                "final_match_score": None,
+                "resulting_timeline_width_px": timeline.width,
             })
             continue
 
