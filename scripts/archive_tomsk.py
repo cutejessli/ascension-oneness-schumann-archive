@@ -190,6 +190,16 @@ def main() -> None:
     print(f"Daily compatibility URL: {snapshot.daily_url}")
     if stitched_bytes:
         print(f"Stitched timeline URL: {stitched_meta['url']}")
+        latest = stitched_meta.get("latest_append", {})
+        print(
+            "Stitch diagnostics: "
+            f"overlap={latest.get('overlap_px')}px ({latest.get('overlap_percent')}%) "
+            f"append={latest.get('append_width_px')}px ({latest.get('append_percent')}%) "
+            f"raw_score={latest.get('match_score_mean_abs_difference')} "
+            f"expected_penalty={latest.get('expected_overlap_penalty')} "
+            f"final_score={latest.get('final_match_score')} "
+            f"timeline_width={latest.get('resulting_timeline_width_px')}"
+        )
     elif stitched_meta:
         print(f"Stitched timeline unchanged: {stitched_meta.get('url')}")
     print(f"Manifest: {public_url(R2_PUBLIC_BASE_URL, 'schumann/tomsk/manifest.json')}")
